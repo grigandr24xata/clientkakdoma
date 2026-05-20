@@ -1,0 +1,880 @@
+import io
+import json
+import logging
+import re
+from datetime import datetime, timezone
+from typing import Any
+from uuid import uuid4
+
+from aiogram import F, Router
+
+import config
+from aiogram.filters import CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message, ReplyKeyboardRemove
+
+from bot import metrics
+from bot.fsm.states import Form
+from bot.keyboards.registration_kb import (
+    DISTRICTS,
+    MANAGERS,
+    add_another_keyboard,
+    back_kb,
+    bad_photo_kb,
+    confirm_keyboard,
+    district_keyboard,
+    manager_keyboard,
+    retry_passport_kb,
+)
+from bot.ocr_orchestrator import ocr_pipeline_extract
+
+logger = logging.getLogger(__name__)
+router = Router(name="registration")
+
+
+def _new_session() -> dict[str, Any]:
+    return {
+        "flow": "registration",
+        "manager_id": None,
+        "district": None,
+        "address": None,
+        "num_people_expected": 0,
+        "passports": [],
+        "current_passport_index": 1,
+        "phone": None,
+        "move_in_date": None,
+        "payment": {},
+        "ocr_cycle_counter": 0,
+        "ocr_retry_counter": 0,
+        "last_ocr_decision": None,
+    }
+
+
+def _session_summary(session: dict[str, Any]) -> str:
+    payment = session.get("payment", {})
+    passports = session.get("passports", [])
+    lines = [
+        "Проверьте данные перед отправкой:",
+        f"• Менеджер: {session.get('manager_id')}",
+        f"• Район: {session.get('district')}",
+        f"• Адрес: {session.get('address')}",
+        f"• Жильцов: {session.get('num_people_expected')}",
+        f"• Паспортов подтверждено: {len(passports)}",
+        f"• Телефон: {session.get('phone')}",
+        f"• Дата заезда: {session.get('move_in_date')}",
+        f"• Аренда: {payment.get('rent')}",
+        f"• Депозит: {payment.get('deposit')}",
+        f"• Комиссия: {payment.get('commission')}",
+    ]
+    return "\n".join(lines)
+
+
+def _is_valid_phone(phone: str) -> bool:
+    return bool(re.fullmatch(r"\+?[0-9()\-\s]{10,20}", phone.strip()))
+
+
+def _quality_retry_reasons(quality: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    if quality.get("blur_bad"):
+        reasons.append("Фото размыто")
+    if not quality.get("checksum_ok", False):
+        reasons.append("MRZ не читается")
+    if float(quality.get("exposure_score", 1.0)) < 0.5:
+        reasons.append("Слишком темное/светлое фото")
+    return reasons
+
+
+def _retry_reasons_from_flags(flags: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    if flags.get("blur_bad"):
+        reasons.append("Фото размыто")
+    if flags.get("exposure_bad"):
+        reasons.append("Слишком темное/светлое фото")
+    if flags.get("checksum_fail"):
+        reasons.append("MRZ не читается")
+    if flags.get("low_confidence"):
+        reasons.append("Низкая уверенность OCR")
+    if flags.get("timeout"):
+        reasons.append("Превышен таймаут OCR")
+    if flags.get("fallback_used"):
+        reasons.append("Использован fallback OCR")
+    return reasons
+
+
+def _parse_manual_passport_input(raw_text: str) -> dict[str, str] | None:
+    parts = [part.strip() for part in raw_text.split(";")]
+    if len(parts) != 6:
+        return None
+    return {
+        "surname": parts[0],
+        "given_names": parts[1],
+        "passport_number": parts[2],
+        "nationality": parts[3],
+        "birth_date": parts[4],
+        "expiry_date": parts[5],
+    }
+
+
+async def _get_session(state: FSMContext) -> dict[str, Any]:
+    data = await state.get_data()
+    return data.get("session", _new_session())
+
+
+async def _go_to_step(
+    message: Message,
+    state: FSMContext,
+    *,
+    next_state: Any,
+    text: str,
+    keyboard: InlineKeyboardMarkup | ReplyKeyboardRemove | None = None,
+    log_step: str,
+) -> None:
+    await state.set_state(next_state)
+    logger.info("FSM step entered: %s", log_step)
+    kwargs = {"reply_markup": keyboard} if keyboard is not None else {}
+    await message.answer(text, **kwargs)
+
+
+@router.message(CommandStart())
+async def start_registration(message: Message, state: FSMContext) -> None:
+    session = _new_session()
+    await state.set_data({"session": session})
+    await _go_to_step(
+        message,
+        state,
+        next_state=Form.choosing_manager,
+        text="Здравствуйте! Начнем регистрацию арендатора. Выберите менеджера:",
+        keyboard=manager_keyboard(),
+        log_step="choosing_manager",
+    )
+
+
+@router.callback_query(F.data == "action:cancel_registration")
+async def process_global_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.clear()
+    logger.info("REGISTRATION_CANCELLED")
+    if callback.message is None:
+        return
+    await callback.message.answer("Регистрация отменена", reply_markup=ReplyKeyboardRemove())
+    await start_registration(callback.message, state)
+
+
+@router.callback_query(Form.ask_district, F.data == "action:back")
+async def back_from_ask_district(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    if callback.message is None:
+        return
+    session = await _get_session(state)
+    session["district"] = None
+    await state.update_data(session=session)
+    logger.info("FSM_BACK_STEP from=ask_district to=choosing_manager")
+    await _go_to_step(
+        callback.message,
+        state,
+        next_state=Form.choosing_manager,
+        text="Выберите менеджера:",
+        keyboard=manager_keyboard(),
+        log_step="choosing_manager",
+    )
+
+
+@router.callback_query(Form.ask_address, F.data == "action:back")
+async def back_from_ask_address(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    if callback.message is None:
+        return
+    session = await _get_session(state)
+    session["address"] = None
+    await state.update_data(session=session)
+    logger.info("FSM_BACK_STEP from=ask_address to=ask_district")
+    await _go_to_step(
+        callback.message,
+        state,
+        next_state=Form.ask_district,
+        text="Укажите район объекта:",
+        keyboard=district_keyboard(),
+        log_step="ask_district",
+    )
+
+
+@router.callback_query(Form.ask_num_people, F.data == "action:back")
+async def back_from_ask_num_people(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    if callback.message is None:
+        return
+    session = await _get_session(state)
+    session["num_people_expected"] = 0
+    session["current_passport_index"] = 1
+    session["passports"] = []
+    await state.update_data(session=session)
+    logger.info("FSM_BACK_STEP from=ask_num_people to=ask_address")
+    await _go_to_step(
+        callback.message,
+        state,
+        next_state=Form.ask_address,
+        text="Введите полный адрес:",
+        keyboard=back_kb(),
+        log_step="ask_address",
+    )
+
+
+@router.callback_query(Form.ask_contacts, F.data == "action:back")
+async def back_from_ask_contacts(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    if callback.message is None:
+        return
+    session = await _get_session(state)
+    session["phone"] = None
+    await state.update_data(session=session)
+    logger.info("FSM_BACK_STEP from=ask_contacts to=ask_add_another_passport")
+    await _go_to_step(
+        callback.message,
+        state,
+        next_state=Form.ask_add_another_passport,
+        text="Добавить еще один паспорт?",
+        keyboard=add_another_keyboard(),
+        log_step="ask_add_another_passport",
+    )
+
+
+@router.callback_query(Form.ask_move_in_date, F.data == "action:back")
+async def back_from_ask_move_in_date(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    if callback.message is None:
+        return
+    session = await _get_session(state)
+    session["move_in_date"] = None
+    await state.update_data(session=session)
+    logger.info("FSM_BACK_STEP from=ask_move_in_date to=ask_contacts")
+    await _go_to_step(
+        callback.message,
+        state,
+        next_state=Form.ask_contacts,
+        text="Введите контактный телефон:",
+        keyboard=back_kb(),
+        log_step="ask_contacts",
+    )
+
+
+@router.callback_query(Form.ask_payment_details, F.data == "action:back")
+async def back_from_ask_payment_details(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    if callback.message is None:
+        return
+    session = await _get_session(state)
+    session["payment"] = {}
+    await state.update_data(session=session)
+    logger.info("FSM_BACK_STEP from=ask_payment_details to=ask_move_in_date")
+    await _go_to_step(
+        callback.message,
+        state,
+        next_state=Form.ask_move_in_date,
+        text="Введите дату заезда в формате YYYY-MM-DD",
+        keyboard=back_kb(),
+        log_step="ask_move_in_date",
+    )
+
+
+@router.callback_query(Form.confirm_passport_fields, F.data == "passport:rescan")
+async def process_retry_passport(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    if callback.message is None:
+        return
+    session = await _get_session(state)
+    passport_index = session.get("current_passport_index", 1)
+    session["passports"] = [p for p in session.get("passports", []) if p.get("index") != passport_index]
+    await state.update_data(session=session)
+    logger.info("PASSPORT_RETRY | passport index=%s", passport_index)
+    await _go_to_step(
+        callback.message,
+        state,
+        next_state=Form.ask_passport_photo,
+        text=f"Отправьте новое фото для паспорта №{passport_index}.",
+        keyboard=bad_photo_kb(),
+        log_step=f"ask_passport_photo | passport index={passport_index}",
+    )
+
+
+@router.callback_query(Form.ask_passport_photo, F.data == "passport:bad_photo")
+async def process_bad_photo_hint(callback: CallbackQuery) -> None:
+    await callback.answer()
+    if callback.message is None:
+        return
+    logger.info("BAD_PHOTO_HINT_SHOWN")
+    await callback.message.answer(
+        "Подсказка по фото паспорта:\n"
+        "• без бликов\n"
+        "• весь разворот\n"
+        "• читаемая MRZ зона\n"
+        "• без обрезки краёв"
+    )
+
+
+@router.callback_query(Form.final_confirmation, F.data == "action:edit_address")
+async def process_edit_address(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    if callback.message is None:
+        return
+    logger.info("FSM_BACK_STEP from=final_confirmation to=ask_address")
+    await _go_to_step(
+        callback.message,
+        state,
+        next_state=Form.ask_address,
+        text="Введите полный адрес:",
+        keyboard=back_kb(),
+        log_step="ask_address",
+    )
+
+
+@router.callback_query(Form.choosing_manager, F.data.startswith("manager:"))
+async def process_manager(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    if callback.message is None:
+        return
+    _, _, manager = (callback.data or "").partition(":")
+    if manager not in MANAGERS:
+        await callback.message.answer("Выберите менеджера с клавиатуры ниже.", reply_markup=manager_keyboard())
+        return
+
+    session = await _get_session(state)
+    session["manager_id"] = manager
+    await state.update_data(session=session)
+
+    await _go_to_step(
+        callback.message,
+        state,
+        next_state=Form.ask_district,
+        text="Укажите район объекта:",
+        keyboard=district_keyboard(),
+        log_step="ask_district",
+    )
+
+
+@router.callback_query(Form.ask_district, F.data.startswith("district:"))
+async def process_district(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    if callback.message is None:
+        return
+    _, _, district = (callback.data or "").partition(":")
+    if not district:
+        await callback.message.answer("Район не должен быть пустым.")
+        return
+
+    if district not in DISTRICTS:
+        await callback.message.answer(
+            "Выберите район из списка или нажмите 'Другой район'.",
+            reply_markup=district_keyboard(),
+        )
+        return
+
+    session = await _get_session(state)
+    session["district"] = district
+    await state.update_data(session=session)
+
+    await _go_to_step(
+        callback.message,
+        state,
+        next_state=Form.ask_address,
+        text="Введите полный адрес:",
+        keyboard=back_kb(),
+        log_step="ask_address",
+    )
+
+
+@router.message(Form.ask_address)
+async def process_address(message: Message, state: FSMContext) -> None:
+    address = (message.text or "").strip()
+    if not address:
+        await message.answer("Адрес не должен быть пустым. Введите адрес еще раз.")
+        return
+
+    session = await _get_session(state)
+    session["address"] = address
+    await state.update_data(session=session)
+
+    await _go_to_step(
+        message,
+        state,
+        next_state=Form.ask_num_people,
+        text="Сколько человек будет проживать?",
+        keyboard=back_kb(),
+        log_step="ask_num_people",
+    )
+
+
+@router.message(Form.ask_num_people)
+async def process_num_people(message: Message, state: FSMContext) -> None:
+    value = (message.text or "").strip()
+    if not value.isdigit() or int(value) <= 0:
+        await message.answer("Введите целое число больше 0.")
+        return
+
+    num_people = int(value)
+    session = await _get_session(state)
+    session["num_people_expected"] = num_people
+    session["current_passport_index"] = 1
+    session["passports"] = []
+    await state.update_data(session=session)
+
+    await _go_to_step(
+        message,
+        state,
+        next_state=Form.ask_passport_photo,
+        text=f"Пришлите фото паспорта №{session['current_passport_index']} (как фото, не файл).",
+        keyboard=bad_photo_kb(),
+        log_step=f"ask_passport_photo | passport index={session['current_passport_index']}",
+    )
+
+
+@router.message(Form.ask_passport_photo, ~F.photo)
+@router.message(Form.rescan_passport, ~F.photo)
+async def process_passport_not_photo(message: Message) -> None:
+    await message.answer("На этом шаге нужно отправить фотографию паспорта.")
+
+
+async def _process_passport_photo_common(message: Message, state: FSMContext, *, source_state: str) -> None:
+    session = await _get_session(state)
+    passport_index = session.get("current_passport_index", 1)
+    logger.info("FSM step entered: %s | passport index=%s", source_state, passport_index)
+
+    photo = message.photo[-1]
+    file = await message.bot.get_file(photo.file_id)
+    buf = io.BytesIO()
+    await message.bot.download(file, destination=buf)
+    img_bytes = buf.getvalue()
+
+    correlation_id = session.get("correlation_id")
+    if not correlation_id:
+        correlation_id = str(uuid4())
+        session["correlation_id"] = correlation_id
+        await state.update_data(session=session)
+
+    ocr_result = ocr_pipeline_extract(img_bytes, correlation_id=correlation_id)
+    text = ocr_result.get("text") or ""
+    parsed_fields = ocr_result.get("parsed") or {}
+    parsed = dict(parsed_fields)
+    mrz_lines = ocr_result.get("mrz_lines")
+    source = ocr_result.get("source") or "unknown"
+    confidence = ocr_result.get("confidence") or "low"
+    quality = ocr_result.get("quality") or {}
+    conf = float(quality.get("confidence", 0.0))
+
+    decision_branch = ocr_result.get("decision_branch") or "soft_fail"
+    timeout_flag = bool(ocr_result.get("timeout_flag", False))
+    retry_reason_flags = ocr_result.get("retry_reason_flags") or {}
+    local_attempts = int(ocr_result.get("attempt_local_count", 0))
+    fallback_attempts = int(ocr_result.get("attempt_fallback_count", 0))
+    total_elapsed_ms = int(ocr_result.get("total_elapsed_ms", 0))
+    used_fallback_provider = ocr_result.get("used_fallback_provider")
+    sla_breach = bool(ocr_result.get("sla_breach", False))
+    passport_hash = ocr_result.get("passport_hash")
+    passport_mrz_len = int(ocr_result.get("passport_mrz_len", 0))
+    metrics_inc = list(ocr_result.get("metrics_inc") or [])
+    logger_version = ocr_result.get("logger_version") or "ocr_sla_v1"
+
+    session["passport_quality"] = quality
+    session["passport_confidence"] = conf
+    session["passport_needs_retry"] = bool(quality.get("needs_retry", False))
+    session["last_ocr_decision"] = decision_branch
+    session["ocr_retry_reason_flags"] = retry_reason_flags
+    session["ocr_retry_counter"] = int(session.get("ocr_retry_counter", 0)) + 1
+
+    manual_mode_triggered = False
+    if decision_branch == "soft_fail":
+        session["ocr_cycle_counter"] = int(session.get("ocr_cycle_counter", 0)) + 1
+        if (
+            config.OCR_SLA_MANUAL_INPUT_AFTER_SECOND_CYCLE
+            and int(session.get("ocr_cycle_counter", 0)) >= 2
+        ):
+            manual_mode_triggered = True
+
+    await state.update_data(session=session)
+
+    logger.info(
+        "OCR_QUALITY: blur=%s confidence=%s checksum_ok=%s needs_retry=%s",
+        quality.get("blur_score"),
+        conf,
+        quality.get("checksum_ok", False),
+        quality.get("needs_retry", False),
+    )
+
+    logger.info("[OCR] handler stage: source=%s, confidence=%s, text_len=%d", source, confidence, len(text))
+
+    if decision_branch == "soft_fail" and "ocr.sla.soft_fail" not in metrics_inc:
+        metrics.inc("ocr.sla.soft_fail")
+        metrics_inc.append("ocr.sla.soft_fail")
+    if decision_branch == "auto_accept" and "ocr.sla.auto_accept" not in metrics_inc:
+        metrics.inc("ocr.sla.auto_accept")
+        metrics_inc.append("ocr.sla.auto_accept")
+    if used_fallback_provider and "ocr.sla.fallback_used" not in metrics_inc:
+        metrics.inc("ocr.sla.fallback_used")
+        metrics_inc.append("ocr.sla.fallback_used")
+    if sla_breach and "ocr.sla.breach" not in metrics_inc:
+        metrics.inc("ocr.sla.breach")
+        metrics_inc.append("ocr.sla.breach")
+
+    ocr_sla_log = {
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+        "level": "INFO",
+        "logger": "OCR_SLA_DECISION",
+        "correlation_id": correlation_id,
+        "deal_id": session.get("deal_id"),
+        "lead_id": session.get("lead_id"),
+        "passport_hash": passport_hash,
+        "passport_mrz_len": passport_mrz_len,
+        "attempt_local_count": local_attempts,
+        "attempt_fallback_count": fallback_attempts,
+        "total_elapsed_ms": total_elapsed_ms,
+        "decision_branch": decision_branch,
+        "used_fallback_provider": used_fallback_provider,
+        "timeout_flag": timeout_flag,
+        "sla_breach": sla_breach,
+        "retry_reason_flags": retry_reason_flags,
+        "metrics_inc": metrics_inc,
+        "logger_version": logger_version,
+    }
+    logger.info(json.dumps(ocr_sla_log, ensure_ascii=False))
+
+    if decision_branch == "soft_fail" or timeout_flag or quality.get("needs_retry"):
+        reasons = _retry_reasons_from_flags(retry_reason_flags) or _quality_retry_reasons(quality)
+        reasons_text = f"\nПричины: {', '.join(reasons)}." if reasons else ""
+
+        if manual_mode_triggered:
+            await _go_to_step(
+                message,
+                state,
+                next_state=Form.manual_input_mode,
+                text=(
+                    "Автораспознавание не удалось после двух циклов. "
+                    "Перейдите к ручному вводу в формате:\n"
+                    "Фамилия;Имя;Номер паспорта;Гражданство;Дата рождения;Срок действия"
+                ),
+                keyboard=back_kb(),
+                log_step=f"manual_input_mode | passport index={passport_index}",
+            )
+            return
+
+        await _go_to_step(
+            message,
+            state,
+            next_state=Form.rescan_passport,
+            text=(
+                "Фото плохо читается. Пожалуйста пришлите более четкое фото паспорта "
+                "(без бликов, полностью MRZ зона)."
+                f"{reasons_text}"
+            ),
+            keyboard=bad_photo_kb(),
+            log_step=f"rescan_passport | passport index={passport_index}",
+        )
+        return
+
+    auto_confirm_passport = decision_branch == "auto_accept"
+
+    if not parsed_fields:
+        await _go_to_step(
+            message,
+            state,
+            next_state=Form.rescan_passport,
+            text="Не удалось распознать паспортные данные. Отправьте более четкое фото этого же паспорта.",
+            keyboard=bad_photo_kb(),
+            log_step=f"rescan_passport | passport index={passport_index}",
+        )
+        return
+
+    passport_entry = {
+        "index": passport_index,
+        "photo_file_id": photo.file_id,
+        "parsed": parsed,
+        "mrz_lines": mrz_lines,
+        "ocr_source": source,
+        "ocr_confidence": confidence,
+        "ocr_quality": quality,
+        "ocr_blur": quality.get("blur_score"),
+        "ocr_exposure": quality.get("exposure_score"),
+        "confirmed": False,
+    }
+
+    if auto_confirm_passport:
+        passport_entry["confirmed"] = True
+
+    passports = [p for p in session.get("passports", []) if p.get("index") != passport_index]
+    passports.append(passport_entry)
+    passports.sort(key=lambda x: x["index"])
+    session["passports"] = passports
+    await state.update_data(session=session)
+
+    parsed_text = "\n".join(
+        [
+            f"Фамилия: {parsed.get('surname', '—')}",
+            f"Имя: {parsed.get('given_names', '—')}",
+            f"Номер паспорта: {parsed.get('passport_number', '—')}",
+            f"Гражданство: {parsed.get('nationality', '—')}",
+            f"Дата рождения: {parsed.get('birth_date', '—')}",
+            f"Срок действия: {parsed.get('expiry_date', '—')}",
+        ]
+    )
+
+    if auto_confirm_passport:
+        await _go_to_step(
+            message,
+            state,
+            next_state=Form.ask_add_another_passport,
+            text=f"Паспорт №{passport_index} распознан и автоматически подтвержден.",
+            keyboard=add_another_keyboard(),
+            log_step=f"ask_add_another_passport | passport index={passport_index}",
+        )
+        return
+
+    await _go_to_step(
+        message,
+        state,
+        next_state=Form.confirm_passport_fields,
+        text=f"Паспорт №{passport_index} распознан:\n\n{parsed_text}\n\nВсе верно?",
+        keyboard=retry_passport_kb(),
+        log_step=f"confirm_passport_fields | passport index={passport_index}",
+    )
+
+
+@router.message(Form.ask_passport_photo, F.photo)
+async def process_passport_photo(message: Message, state: FSMContext) -> None:
+    await _process_passport_photo_common(message, state, source_state="ask_passport_photo")
+
+
+@router.message(Form.rescan_passport, F.photo)
+async def process_passport_rescan_photo(message: Message, state: FSMContext) -> None:
+    await _process_passport_photo_common(message, state, source_state="rescan_passport")
+
+
+@router.message(Form.manual_input_mode)
+async def process_manual_input_mode(message: Message, state: FSMContext) -> None:
+    session = await _get_session(state)
+    passport_index = session.get("current_passport_index", 1)
+    parsed = _parse_manual_passport_input((message.text or "").strip())
+    if not parsed:
+        await message.answer(
+            "Неверный формат. Введите данные так:\nФамилия;Имя;Номер паспорта;Гражданство;Дата рождения;Срок действия"
+        )
+        return
+
+    passport_entry = {
+        "index": passport_index,
+        "photo_file_id": None,
+        "parsed": parsed,
+        "mrz_lines": None,
+        "ocr_source": "manual_input",
+        "ocr_confidence": "manual",
+        "ocr_quality": session.get("passport_quality", {}),
+        "ocr_blur": None,
+        "ocr_exposure": None,
+        "confirmed": True,
+    }
+
+    passports = [p for p in session.get("passports", []) if p.get("index") != passport_index]
+    passports.append(passport_entry)
+    passports.sort(key=lambda x: x["index"])
+    session["passports"] = passports
+    await state.update_data(session=session)
+
+    await _go_to_step(
+        message,
+        state,
+        next_state=Form.ask_add_another_passport,
+        text=f"Паспорт №{passport_index} сохранен в ручном режиме.",
+        keyboard=add_another_keyboard(),
+        log_step=f"ask_add_another_passport | passport index={passport_index}",
+    )
+
+
+@router.callback_query(
+    Form.confirm_passport_fields,
+    F.data.in_({"passport:ok", "confirm:no"}),
+)
+async def process_passport_confirmation(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    if callback.message is None:
+        return
+    _, _, value = (callback.data or "").partition(":")
+    if value not in {"ok", "no"}:
+        await callback.message.answer("Пожалуйста, выберите Да или Нет.", reply_markup=retry_passport_kb())
+        return
+
+    session = await _get_session(state)
+    passport_index = session.get("current_passport_index", 1)
+    passports = session.get("passports", [])
+
+    for passport in passports:
+        if passport.get("index") == passport_index:
+            passport["confirmed"] = value == "ok"
+            break
+
+    logger.info("confirmation result=%s | passport index=%s", value, passport_index)
+
+    session["passports"] = passports
+    await state.update_data(session=session)
+
+    if value == "no":
+        await _go_to_step(
+            callback.message,
+            state,
+            next_state=Form.ask_passport_photo,
+            text=f"Хорошо, отправьте новое фото для паспорта №{passport_index}.",
+            keyboard=bad_photo_kb(),
+            log_step=f"ask_passport_photo | passport index={passport_index}",
+        )
+        return
+
+    await _go_to_step(
+        callback.message,
+        state,
+        next_state=Form.ask_add_another_passport,
+        text="Добавить еще один паспорт?",
+        keyboard=add_another_keyboard(),
+        log_step=f"ask_add_another_passport | passport index={passport_index}",
+    )
+
+
+@router.callback_query(Form.ask_add_another_passport, F.data.startswith("residents:"))
+async def process_add_another_passport(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    if callback.message is None:
+        return
+    _, _, answer = (callback.data or "").partition(":")
+    if answer not in {"add_more", "continue"}:
+        await callback.message.answer("Выберите вариант на клавиатуре.", reply_markup=add_another_keyboard())
+        return
+
+    session = await _get_session(state)
+
+    confirmed_count = sum(1 for p in session.get("passports", []) if p.get("confirmed"))
+    expected = session.get("num_people_expected", 0)
+
+    if answer == "add_more":
+        session["current_passport_index"] = session.get("current_passport_index", 1) + 1
+        await state.update_data(session=session)
+        await _go_to_step(
+            callback.message,
+            state,
+            next_state=Form.ask_passport_photo,
+            text=f"Пришлите фото паспорта №{session['current_passport_index']}.",
+            keyboard=bad_photo_kb(),
+            log_step=f"ask_passport_photo | passport index={session['current_passport_index']}",
+        )
+        return
+
+    if confirmed_count < expected:
+        await callback.message.answer(
+            f"Подтверждено паспортов: {confirmed_count} из {expected}. Добавьте оставшиеся.",
+            reply_markup=add_another_keyboard(),
+        )
+        return
+
+    await _go_to_step(
+        callback.message,
+        state,
+        next_state=Form.ask_contacts,
+        text="Введите контактный телефон:",
+        keyboard=back_kb(),
+        log_step="ask_contacts",
+    )
+
+
+@router.message(Form.ask_contacts)
+async def process_contacts(message: Message, state: FSMContext) -> None:
+    phone = (message.text or "").strip()
+    if not _is_valid_phone(phone):
+        await message.answer("Введите корректный телефон, например +79991234567")
+        return
+
+    session = await _get_session(state)
+    session["phone"] = phone
+    await state.update_data(session=session)
+
+    await _go_to_step(
+        message,
+        state,
+        next_state=Form.ask_move_in_date,
+        text="Введите дату заезда в формате YYYY-MM-DD",
+        keyboard=back_kb(),
+        log_step="ask_move_in_date",
+    )
+
+
+@router.message(Form.ask_move_in_date)
+async def process_move_in_date(message: Message, state: FSMContext) -> None:
+    date_text = (message.text or "").strip()
+    try:
+        datetime.strptime(date_text, "%Y-%m-%d")
+    except ValueError:
+        await message.answer("Неверный формат даты. Используйте YYYY-MM-DD")
+        return
+
+    session = await _get_session(state)
+    session["move_in_date"] = date_text
+    await state.update_data(session=session)
+
+    await _go_to_step(
+        message,
+        state,
+        next_state=Form.ask_payment_details,
+        text="Введите платежи в формате: аренда, депозит, комиссия",
+        keyboard=back_kb(),
+        log_step="ask_payment_details",
+    )
+
+
+@router.message(Form.ask_payment_details)
+async def process_payment_details(message: Message, state: FSMContext) -> None:
+    raw = (message.text or "").strip()
+    chunks = [c.strip().replace(" ", "") for c in raw.split(",")]
+    if len(chunks) != 3 or not all(re.fullmatch(r"\d+(\.\d+)?", c) for c in chunks):
+        await message.answer("Нужен формат: аренда, депозит, комиссия. Например: 50000, 30000, 25000")
+        return
+
+    session = await _get_session(state)
+    session["payment"] = {
+        "rent": float(chunks[0]),
+        "deposit": float(chunks[1]),
+        "commission": float(chunks[2]),
+    }
+    await state.update_data(session=session)
+
+    await _go_to_step(
+        message,
+        state,
+        next_state=Form.final_confirmation,
+        text=_session_summary(session),
+        keyboard=confirm_keyboard(),
+        log_step="final_confirmation",
+    )
+
+
+@router.callback_query(Form.final_confirmation, F.data.in_({"action:confirm", "action:cancel"}))
+async def process_final_confirmation(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    if callback.message is None:
+        return
+    _, _, answer = (callback.data or "").partition(":")
+    if answer not in {"confirm", "cancel"}:
+        await callback.message.answer("Выберите Подтвердить или Отменить.", reply_markup=confirm_keyboard())
+        return
+
+    session = await _get_session(state)
+
+    if answer == "cancel":
+        await state.clear()
+        logger.info("REGISTRATION_CANCELLED")
+        await callback.message.answer("Регистрация отменена", reply_markup=ReplyKeyboardRemove())
+        await start_registration(callback.message, state)
+        return
+
+    logger.info("confirmation result=%s | flow=%s", answer, session.get("flow"))
+    await _go_to_step(
+        callback.message,
+        state,
+        next_state=Form.done,
+        text="Спасибо! Регистрация завершена ✅",
+        keyboard=ReplyKeyboardRemove(),
+        log_step="done",
+    )
+    await state.clear()
