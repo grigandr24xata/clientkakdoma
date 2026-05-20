@@ -1,4 +1,6 @@
+from datetime import datetime
 from enum import Enum
+import uuid
 
 from pydantic import BaseModel, Field
 
@@ -9,16 +11,23 @@ class IntakeBranch(str, Enum):
 
 
 class IntakeResident(BaseModel):
-    id: str
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    order_index: int
     full_name: str | None = None
-    phone: str | None = None
     is_main: bool = False
+    phone: str | None = None
+    ocr_data: dict | None = None
+    ocr_confirmed: bool = False
+    extra_docs_uploaded: bool = False
 
 
 class IntakeCase(BaseModel):
     id: str
     phone: str
     branch: IntakeBranch
-    step: str = Field(default="phone_verified")
+    resident_count: int = 0
+    step: str = "phone_verified"
+    status: str = "draft"
     residents: list[IntakeResident] = Field(default_factory=list)
-    status: str = Field(default="draft")
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
