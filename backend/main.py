@@ -2,6 +2,7 @@ from fastapi import FastAPI
 
 from backend.apartments.router import router as apartments_router
 from backend.audit.router import router as audit_router
+from backend.clients.router import router as clients_router
 from backend.auth.router import router as auth_router
 from backend.dashboard.router import router as dashboard_router
 from backend.dedup.router import router as dedup_router
@@ -33,3 +34,4 @@ app.include_router(payments_router)
 app.include_router(files_router)
 app.include_router(dashboard_router)
 app.include_router(audit_router)
+app.include_router(clients_router)
