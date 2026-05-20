@@ -1,11 +1,20 @@
-from fastapi import APIRouter, Depends, HTTPException
+from dataclasses import asdict
+
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
 
 from backend.auth.deps import get_current_phone
 from backend.intake import store
+from backend.files.store import FileRecord, get_files_for_case, save_file_record
 from backend.intake.models import IntakeBranch, IntakeCase, IntakeResident
+from backend.intake.ocr_flow import handle_passport_upload
 
 router = APIRouter(prefix="/intake", tags=["intake"])
+
+
+ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png"}
+ALLOWED_EXTRA_DOC_TYPES = {"migration_card", "patent", "work_contract", "other"}
+MAX_UPLOAD_SIZE_BYTES = 10 * 1024 * 1024
 
 
 class CaseCreateRequest(BaseModel):
@@ -143,3 +152,68 @@ def submit_case(case_id: str, current_phone: str = Depends(get_current_phone)) -
 @router.get("/cases", response_model=list[IntakeCase])
 def list_cases(current_phone: str = Depends(get_current_phone)) -> list[IntakeCase]:
     return store.list_cases_by_phone(current_phone)
+
+
+@router.post("/cases/{case_id}/residents/{order_index}/passport")
+async def upload_passport(
+    case_id: str,
+    order_index: int,
+    file: UploadFile = File(...),
+    current_phone: str = Depends(get_current_phone),
+) -> dict:
+    case = _get_owned_case(case_id, current_phone)
+    if order_index < 1 or order_index > case.resident_count:
+        raise HTTPException(status_code=400, detail="Invalid resident order index")
+
+    if file.content_type not in ALLOWED_IMAGE_TYPES:
+        raise HTTPException(status_code=400, detail="Only image/jpeg and image/png are supported")
+
+    image_bytes = await file.read()
+    if len(image_bytes) > MAX_UPLOAD_SIZE_BYTES:
+        raise HTTPException(status_code=400, detail="File is too large. Maximum allowed size is 10MB")
+
+    return await handle_passport_upload(
+        intake_case_id=case.id,
+        resident_order_index=order_index,
+        image_bytes=image_bytes,
+        content_type=file.content_type or "application/octet-stream",
+        original_filename=file.filename or "passport",
+    )
+
+
+@router.post("/cases/{case_id}/extra-docs")
+async def upload_extra_doc(
+    case_id: str,
+    file: UploadFile = File(...),
+    file_type: str = Query(...),
+    resident_order_index: int | None = Query(default=None),
+    current_phone: str = Depends(get_current_phone),
+) -> dict:
+    case = _get_owned_case(case_id, current_phone)
+
+    if file_type not in ALLOWED_EXTRA_DOC_TYPES:
+        raise HTTPException(status_code=400, detail="Unsupported file_type")
+
+    if resident_order_index is not None and (resident_order_index < 1 or resident_order_index > case.resident_count):
+        raise HTTPException(status_code=400, detail="Invalid resident order index")
+
+    file_bytes = await file.read()
+    file_record = FileRecord(
+        intake_case_id=case.id,
+        resident_order_index=resident_order_index,
+        file_type=file_type,
+        original_filename=file.filename or "document",
+        content_type=file.content_type or "application/octet-stream",
+        size_bytes=len(file_bytes),
+        storage_key=f"intake/{case.id}/extra/{file_type}/{file.filename or 'document'}",
+        storage_url=f"stub://intake/{case.id}/extra/{file_type}/{file.filename or 'document'}",
+    )
+    save_file_record(file_record)
+
+    return {"file_id": file_record.id, "file_type": file_record.file_type, "status": "uploaded"}
+
+
+@router.get("/cases/{case_id}/files")
+def get_case_files(case_id: str, current_phone: str = Depends(get_current_phone)) -> list[dict]:
+    _get_owned_case(case_id, current_phone)
+    return [asdict(file_record) for file_record in get_files_for_case(case_id)]
