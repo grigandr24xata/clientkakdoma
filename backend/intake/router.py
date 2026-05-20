@@ -7,6 +7,8 @@ from backend.auth.deps import get_current_phone
 from backend.intake import store
 from backend.files.store import FileRecord, get_files_for_case, save_file_record
 from backend.intake.models import IntakeBranch, IntakeCase, IntakeResident
+from backend.deals.service import create_deal_from_intake
+from backend.deals.store import get_deal_by_intake as store_get_deal_by_intake
 from backend.intake.ocr_flow import handle_passport_upload
 
 router = APIRouter(prefix="/intake", tags=["intake"])
@@ -138,15 +140,28 @@ def patch_resident_phone(
     return store.update_case(case)
 
 
-@router.post("/cases/{case_id}/submit", response_model=IntakeCase)
-def submit_case(case_id: str, current_phone: str = Depends(get_current_phone)) -> IntakeCase:
+class SubmitCaseResponse(BaseModel):
+    case: IntakeCase
+    deal_id: str
+
+
+@router.post("/cases/{case_id}/submit", response_model=SubmitCaseResponse)
+def submit_case(case_id: str, current_phone: str = Depends(get_current_phone)) -> SubmitCaseResponse:
     case = _get_owned_case(case_id, current_phone)
     if any(not resident.ocr_confirmed for resident in case.residents):
         raise HTTPException(status_code=400, detail="All residents must be OCR-confirmed")
 
     case.status = "submitted"
     case.step = "submitted"
-    return store.update_case(case)
+    case = store.update_case(case)
+
+    existing_deal = store_get_deal_by_intake(case.id)
+    if not existing_deal:
+        deal = create_deal_from_intake(case)
+    else:
+        deal = existing_deal
+
+    return SubmitCaseResponse(case=case, deal_id=deal.id)
 
 
 @router.get("/cases", response_model=list[IntakeCase])
