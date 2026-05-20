@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     OCR_FALLBACK_ENABLED: bool = True
 
     JWT_SECRET: str = "change-me"
+    TEST_SMS_CODE: str = ""
 
 
 settings = Settings()
