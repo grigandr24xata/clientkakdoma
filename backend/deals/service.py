@@ -1,3 +1,4 @@
+from backend.audit.service import log_action
 from backend.deals.models import Deal
 
 
@@ -57,7 +58,9 @@ def create_deal_from_intake(intake_case) -> Deal:
         status=DealStatus.client_data_collected,
         residents=residents,
     )
-    return create_deal(deal)
+    created = create_deal(deal)
+    log_action(entity_type="deal", entity_id=created.id, action="deal_created", actor_id="system")
+    return created
 
 
 def check_activation_conditions(deal: Deal) -> bool:
@@ -80,5 +83,7 @@ def try_activate_deal(deal: Deal) -> Deal:
 
     if check_activation_conditions(deal):
         deal.status = DealStatus.active
-        return update_deal(deal)
+        updated = update_deal(deal)
+        log_action(entity_type="deal", entity_id=updated.id, action="deal_activated", actor_id="system")
+        return updated
     return deal

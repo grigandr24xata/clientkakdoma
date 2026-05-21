@@ -1,5 +1,6 @@
 from fastapi import APIRouter
 
+from backend.audit.service import get_recent_actions, serialize_entries
 from backend.dashboard.service import (
     get_apartments_summary,
     get_deals_summary,
@@ -46,3 +47,8 @@ def get_dashboard_owner_payments_summary() -> dict:
 @router.get("/ocr-quality")
 def get_dashboard_ocr_quality() -> dict:
     return get_ocr_quality_dashboard()
+
+
+@router.get("/recent-activity")
+def get_dashboard_recent_activity() -> list[dict]:
+    return serialize_entries(get_recent_actions(limit=10))
