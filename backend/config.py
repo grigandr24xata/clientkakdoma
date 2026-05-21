@@ -23,6 +23,7 @@ class Settings(BaseSettings):
 
     JWT_SECRET: str = "change-me"
     TEST_SMS_CODE: str = ""
+    USE_DATABASE: bool = False
 
 
 settings = Settings()

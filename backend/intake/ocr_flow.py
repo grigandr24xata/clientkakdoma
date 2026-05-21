@@ -1,6 +1,6 @@
 import uuid
 
-from backend.files.store import FileRecord, save_file_record
+from backend.files.store import save_file_bytes
 from backend.ocr.metrics import record_ocr_metric
 from backend.ocr.service import process_passport_ocr
 
@@ -23,18 +23,14 @@ async def handle_passport_upload(
     """
     corr = correlation_id or str(uuid.uuid4())
 
-    file_key = f"intake/{intake_case_id}/resident_{resident_order_index}/passport_{corr}"
-    file_record = FileRecord(
+    file_record = save_file_bytes(
         intake_case_id=intake_case_id,
         resident_order_index=resident_order_index,
         file_type="passport",
         original_filename=original_filename,
         content_type=content_type,
-        size_bytes=len(image_bytes),
-        storage_key=file_key,
-        storage_url=f"stub://{file_key}",
+        data=image_bytes,
     )
-    save_file_record(file_record)
 
     ocr_result = await process_passport_ocr(image_bytes, corr)
 
