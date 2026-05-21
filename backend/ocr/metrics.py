@@ -77,3 +77,83 @@ def get_metrics_summary() -> dict[str, Any]:
         "fallback_rate": round(fallback_used / total, 3),
         "by_final_source": by_source,
     }
+
+
+def get_ocr_quality_dashboard() -> dict[str, Any]:
+    total = len(_metrics_store)
+    if total == 0:
+        return {"total": 0, "message": "No OCR runs recorded yet"}
+
+    auto_accepted = [m for m in _metrics_store if m.auto_accepted]
+    manual_check = [m for m in _metrics_store if m.manual_check]
+    fallback_used = [m for m in _metrics_store if m.fallback_stage_reached is not None]
+    sla_breach = [m for m in _metrics_store if m.sla_breach]
+
+    by_source: dict[str, int] = {}
+    for m in _metrics_store:
+        by_source[m.final_source] = by_source.get(m.final_source, 0) + 1
+
+    avg_confidence = sum(m.primary_confidence for m in _metrics_store) / total
+
+    problematic = [m for m in _metrics_store if m.manual_check or m.sla_breach]
+    recent_problematic = sorted(problematic, key=lambda m: m.created_at, reverse=True)[:10]
+
+    from datetime import date, timedelta
+
+    today = date.today()
+    daily_trend: dict[str, dict[str, float | int]] = {}
+    for i in range(7):
+        day = today - timedelta(days=i)
+        day_str = day.isoformat()
+        day_runs = [m for m in _metrics_store if m.created_at.date() == day]
+        if day_runs:
+            day_auto = sum(1 for m in day_runs if m.auto_accepted)
+            daily_trend[day_str] = {
+                "total": len(day_runs),
+                "auto_accepted": day_auto,
+                "auto_accepted_rate": round(day_auto / len(day_runs), 3),
+            }
+
+    return {
+        "total": total,
+        "rates": {
+            "auto_accepted": round(len(auto_accepted) / total, 3),
+            "manual_check": round(len(manual_check) / total, 3),
+            "fallback_used": round(len(fallback_used) / total, 3),
+            "sla_breach": round(len(sla_breach) / total, 3),
+        },
+        "avg_confidence": round(avg_confidence, 3),
+        "by_final_source": by_source,
+        "recent_problematic": [
+            {
+                "id": m.id,
+                "correlation_id": m.correlation_id,
+                "intake_resident_id": m.intake_resident_id,
+                "final_source": m.final_source,
+                "confidence": m.primary_confidence,
+                "manual_check": m.manual_check,
+                "sla_breach": m.sla_breach,
+                "warnings": m.warnings,
+                "created_at": m.created_at.isoformat(),
+            }
+            for m in recent_problematic
+        ],
+        "daily_trend": daily_trend,
+    }
+
+
+def get_low_confidence_runs(threshold: float = 0.6) -> list[dict[str, Any]]:
+    """Запуски с низкой уверенностью — кандидаты на ручную проверку."""
+    return [
+        {
+            "id": m.id,
+            "correlation_id": m.correlation_id,
+            "intake_resident_id": m.intake_resident_id,
+            "confidence": m.primary_confidence,
+            "final_source": m.final_source,
+            "warnings": m.warnings,
+            "created_at": m.created_at.isoformat(),
+        }
+        for m in _metrics_store
+        if m.primary_confidence < threshold and not m.auto_accepted
+    ]
