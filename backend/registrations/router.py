@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from backend.apartments.store import get_apartment
+from backend.audit.service import log_action
 from backend.registrations.models import Registration, RegistrationStatus
 from backend.registrations.service import add_registration, refresh_registration_statuses
 from backend.registrations.store import (
@@ -57,6 +58,7 @@ def expiring_registrations() -> list[Registration]:
 def create_registration(payload: RegistrationCreate) -> dict:
     reg = Registration(**payload.model_dump())
     created = add_registration(reg)
+    log_action(entity_type="registration", entity_id=created.id, action="registration_created", actor_id="system")
 
     apt = get_apartment(created.apartment_id)
     if apt and apt.current_reg_count >= 20:
@@ -78,7 +80,9 @@ def close_registration(reg_id: str) -> Registration:
     if not reg:
         raise HTTPException(status_code=404, detail="registration_not_found")
     reg.status = RegistrationStatus.closed
-    return update_registration(reg)
+    updated = update_registration(reg)
+    log_action(entity_type="registration", entity_id=updated.id, action="registration_closed", actor_id="system")
+    return updated
 
 
 @router.patch("/{reg_id}/mfc-doc")

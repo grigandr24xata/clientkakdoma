@@ -3,6 +3,7 @@ from datetime import datetime
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from backend.audit.service import log_action
 from backend.clients.models import Client, ClientPassport
 from backend.clients.store import add_passport_to_client, create_client, get_client, list_all_clients
 
@@ -51,7 +52,9 @@ def get_clients() -> list[Client]:
 def create_client_manually(payload: ClientCreateRequest) -> Client:
     data = payload.model_dump()
     data["updated_at"] = datetime.utcnow()
-    return create_client(data)
+    created = create_client(data)
+    log_action(entity_type="client", entity_id=created.id, action="client_created", actor_id="system")
+    return created
 
 
 @router.patch("/{client_id}/passport", response_model=Client)
@@ -61,4 +64,6 @@ def patch_client_passport(client_id: str, payload: PassportPatchRequest) -> Clie
         raise HTTPException(status_code=404, detail="Client not found")
 
     passport = ClientPassport(**payload.model_dump())
-    return add_passport_to_client(client_id, passport)
+    updated = add_passport_to_client(client_id, passport)
+    log_action(entity_type="client", entity_id=updated.id, action="passport_added", actor_id="system")
+    return updated

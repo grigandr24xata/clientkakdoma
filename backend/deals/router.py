@@ -3,6 +3,7 @@ from datetime import date
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from backend.audit.service import log_action
 from backend.deals.models import Deal, DealStatus
 from backend.deals.service import try_activate_deal
 from backend.deals.store import get_deal, list_deals, update_deal
@@ -89,7 +90,15 @@ def patch_status(deal_id: str, payload: StatusPatchRequest) -> Deal:
     if payload.status in {DealStatus.active, DealStatus.completed}:
         raise HTTPException(status_code=400, detail="Use activation conditions or complete endpoint")
     deal.status = payload.status
-    return update_deal(deal)
+    updated = update_deal(deal)
+    log_action(
+        entity_type="deal",
+        entity_id=updated.id,
+        action="deal_status_changed",
+        actor_id="system",
+        payload={"new_status": payload.status.value},
+    )
+    return updated
 
 
 @router.patch("/{deal_id}/documents", response_model=Deal)
@@ -107,6 +116,13 @@ def patch_payment(deal_id: str, payload: PaymentPatchRequest) -> Deal:
     deal = _get_or_404(deal_id)
     deal.payment_confirmed = payload.confirmed
     updated = update_deal(deal)
+    if payload.confirmed:
+        log_action(
+            entity_type="deal",
+            entity_id=updated.id,
+            action="payment_confirmed",
+            actor_id="system",
+        )
     return try_activate_deal(updated)
 
 
@@ -114,4 +130,6 @@ def patch_payment(deal_id: str, payload: PaymentPatchRequest) -> Deal:
 def complete_deal(deal_id: str) -> Deal:
     deal = _get_or_404(deal_id)
     deal.status = DealStatus.completed
-    return update_deal(deal)
+    updated = update_deal(deal)
+    log_action(entity_type="deal", entity_id=updated.id, action="deal_completed", actor_id="system")
+    return updated
