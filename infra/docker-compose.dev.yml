@@ -1,42 +1,88 @@
 services:
   postgres:
     image: postgres:16
+    restart: unless-stopped
     ports:
       - "5432:5432"
-    env_file:
-      - .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-rent_reg}
     volumes:
       - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   directus:
-    image: directus/directus:latest
+    image: directus/directus:11
+    restart: unless-stopped
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     ports:
       - "8055:8055"
-    env_file:
-      - .env
+    environment:
+      SECRET: ${DIRECTUS_SECRET:-change-me-in-production}
+      DB_CLIENT: pg
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_DATABASE: ${POSTGRES_DB:-rent_reg}
+      DB_USER: ${POSTGRES_USER:-postgres}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      ADMIN_EMAIL: ${DIRECTUS_ADMIN_EMAIL:-admin@example.com}
+      ADMIN_PASSWORD: ${DIRECTUS_ADMIN_PASSWORD:-admin123}
+      WEBSOCKETS_ENABLED: "false"
+    volumes:
+      - directus_uploads:/directus/uploads
 
   minio:
     image: minio/minio
+    restart: unless-stopped
     command: server /data --console-address ":9001"
     ports:
       - "9000:9000"
       - "9001:9001"
-    env_file:
-      - .env
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
     volumes:
       - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   backend:
-    build: ./backend
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     ports:
       - "8000:8000"
-    env_file:
-      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-rent_reg}
+      DIRECTUS_URL: http://directus:8055
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      S3_BUCKET: ${S3_BUCKET:-files-media}
+      JWT_SECRET: ${JWT_SECRET:-change-me}
+      TEST_SMS_CODE: ${TEST_SMS_CODE:-1234}
+      USE_DATABASE: ${USE_DATABASE:-false}
+      OCR_SPACE_API_KEY: ${OCR_SPACE_API_KEY:-}
+      YANDEX_VISION_API_KEY: ${YANDEX_VISION_API_KEY:-}
+      YANDEX_FOLDER_ID: ${YANDEX_FOLDER_ID:-}
+      MIN_CONFIDENCE: ${MIN_CONFIDENCE:-0.85}
+      OCR_FALLBACK_ENABLED: ${OCR_FALLBACK_ENABLED:-true}
 
 volumes:
   pg_data:
   minio_data:
+  directus_uploads:
