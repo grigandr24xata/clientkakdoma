@@ -4,7 +4,11 @@ from typing import Any
 
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 
-from backend.ocr.metrics import get_metrics_summary
+from backend.ocr.metrics import (
+    get_low_confidence_runs,
+    get_metrics_summary,
+    get_ocr_quality_dashboard,
+)
 from backend.ocr.schemas import OCRPassportResult
 from backend.ocr.service import process_passport_ocr
 
@@ -54,3 +58,14 @@ async def ocr_passport(
 def ocr_metrics_summary() -> dict[str, Any]:
     # internal, add auth in WAVE 8
     return get_metrics_summary()
+
+
+@router.get("/metrics/dashboard")
+def ocr_metrics_dashboard() -> dict[str, Any]:
+    # internal — add auth in WAVE 9/prod
+    return get_ocr_quality_dashboard()
+
+
+@router.get("/metrics/low-confidence")
+def ocr_low_confidence_runs(threshold: float = Query(default=0.6)) -> list[dict[str, Any]]:
+    return get_low_confidence_runs(threshold)

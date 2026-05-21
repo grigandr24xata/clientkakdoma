@@ -8,6 +8,7 @@ from backend.dashboard.service import (
     get_owner_payments_summary,
     get_registrations_summary,
 )
+from backend.ocr.metrics import get_ocr_quality_dashboard
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
@@ -40,3 +41,8 @@ def get_dashboard_finance_summary() -> dict:
 @router.get("/owner-payments")
 def get_dashboard_owner_payments_summary() -> dict:
     return get_owner_payments_summary()
+
+
+@router.get("/ocr-quality")
+def get_dashboard_ocr_quality() -> dict:
+    return get_ocr_quality_dashboard()
